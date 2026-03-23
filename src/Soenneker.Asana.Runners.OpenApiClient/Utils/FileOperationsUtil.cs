@@ -1,21 +1,25 @@
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Configuration;
-using Soenneker.Extensions.String;
-using Soenneker.Git.Util.Abstract;
+using Microsoft.Extensions.Logging;
 using Soenneker.Asana.Runners.OpenApiClient.Utils.Abstract;
+using Soenneker.Extensions.String;
+using Soenneker.Extensions.ValueTask;
+using Soenneker.Git.Util.Abstract;
+using Soenneker.OpenApi.Fixer;
+using Soenneker.OpenApi.Fixer.Abstract;
+using Soenneker.Utils.Directory.Abstract;
 using Soenneker.Utils.Dotnet.Abstract;
 using Soenneker.Utils.Environment;
+using Soenneker.Utils.File.Abstract;
+using Soenneker.Utils.File.Download.Abstract;
 using Soenneker.Utils.Process.Abstract;
+using Soenneker.Utils.Yaml;
+using Soenneker.Utils.Yaml.Abstract;
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using Soenneker.Extensions.ValueTask;
-using Soenneker.Utils.Directory.Abstract;
-using Soenneker.Utils.File.Abstract;
-using Soenneker.Utils.File.Download.Abstract;
-using System.Collections.Generic;
 
 namespace Soenneker.Asana.Runners.OpenApiClient.Utils;
 
@@ -30,9 +34,12 @@ public sealed class FileOperationsUtil : IFileOperationsUtil
     private readonly IFileDownloadUtil _fileDownloadUtil;
     private readonly IFileUtil _fileUtil;
     private readonly IDirectoryUtil _directoryUtil;
+    private readonly IOpenApiFixer _openApiFixer;
+    private readonly IYamlUtil _yamlUtil;
 
-    public FileOperationsUtil(ILogger<FileOperationsUtil> logger, IConfiguration configuration, IGitUtil gitUtil, IDotnetUtil dotnetUtil, IProcessUtil processUtil, 
-        IFileDownloadUtil fileDownloadUtil, IFileUtil fileUtil, IDirectoryUtil directoryUtil)
+    public FileOperationsUtil(ILogger<FileOperationsUtil> logger, IConfiguration configuration, IGitUtil gitUtil, IDotnetUtil dotnetUtil,
+        IProcessUtil processUtil, IFileDownloadUtil fileDownloadUtil, IFileUtil fileUtil, IDirectoryUtil directoryUtil, IOpenApiFixer openApiFixer,
+        IYamlUtil yamlUtil)
     {
         _logger = logger;
         _configuration = configuration;
@@ -42,31 +49,50 @@ public sealed class FileOperationsUtil : IFileOperationsUtil
         _fileDownloadUtil = fileDownloadUtil;
         _fileUtil = fileUtil;
         _directoryUtil = directoryUtil;
+        _openApiFixer = openApiFixer;
+        _yamlUtil = yamlUtil;
     }
 
     public async ValueTask Process(CancellationToken cancellationToken = default)
     {
-        string gitDirectory = await _gitUtil.CloneToTempDirectory($"https://github.com/soenneker/{Constants.Library.ToLowerInvariantFast()}", cancellationToken: cancellationToken);
+        string gitDirectory = await _gitUtil.CloneToTempDirectory($"https://github.com/soenneker/{Constants.Library.ToLowerInvariantFast()}",
+            cancellationToken: cancellationToken);
 
-        string targetFilePath = Path.Combine(gitDirectory, "openapi.yaml");
+        string yamlFilePath = Path.Combine(gitDirectory, "openapi.yaml");
 
-        await _fileUtil.DeleteIfExists(targetFilePath, cancellationToken: cancellationToken);
+        await _fileUtil.DeleteIfExists(yamlFilePath, cancellationToken: cancellationToken);
 
-        string openApiDocumentUrl = _configuration["Asana:ClientGenerationUrl"] ?? "https://raw.githubusercontent.com/Asana/openapi/refs/heads/master/defs/asana_oas.yaml";
+        string openApiDocumentUrl = _configuration["Asana:ClientGenerationUrl"] ??
+                                    "https://raw.githubusercontent.com/Asana/openapi/refs/heads/master/defs/asana_sdk_oas.yaml";
 
-        string? filePath = await _fileDownloadUtil.Download(openApiDocumentUrl,
-            targetFilePath, fileExtension: ".yaml", cancellationToken: cancellationToken);
+        string? yamlDownloadedPath = await _fileDownloadUtil.Download(openApiDocumentUrl, yamlFilePath, fileExtension: ".yaml", cancellationToken: cancellationToken);
 
-        await _processUtil.Start("dotnet", null, "tool update --global Microsoft.OpenApi.Kiota", waitForExit: true, cancellationToken: cancellationToken);
+        var yaml = await _fileUtil.Read(yamlDownloadedPath, true, cancellationToken);
+
+        var json = _yamlUtil.YamlToJson(yaml);
+
+        string jsonFilePath = Path.Combine(gitDirectory, "openapi.json");
+
+        await _fileUtil.Write(jsonFilePath, json, true, cancellationToken);
+
+        string fixedFilePath = Path.Combine(gitDirectory, "fixed.json");
+
+        await _openApiFixer.Fix(jsonFilePath, fixedFilePath, cancellationToken);
+
+         await _processUtil.Start("dotnet", null, "tool update --global Microsoft.OpenApi.Kiota", waitForExit: true,
+            cancellationToken: cancellationToken);
 
         string srcDirectory = Path.Combine(gitDirectory, "src", Constants.Library);
 
         await DeleteAllExceptCsproj(srcDirectory, cancellationToken);
 
-        await _processUtil.Start("kiota", gitDirectory, $"kiota generate -l CSharp -d \"{filePath}\" -o src/{Constants.Library} -c AsanaOpenApiClient -n {Constants.Library}",
-            waitForExit: true, cancellationToken: cancellationToken).NoSync();
+        await _processUtil.Start("kiota", gitDirectory,
+                              $"kiota generate -l CSharp -d \"{yamlFilePath}\" -o src/{Constants.Library} -c AsanaOpenApiClient -n {Constants.Library}",
+                              waitForExit: true, cancellationToken: cancellationToken)
+                          .NoSync();
 
-        await BuildAndPush(gitDirectory, cancellationToken).NoSync();
+        await BuildAndPush(gitDirectory, cancellationToken)
+            .NoSync();
     }
 
     public async ValueTask DeleteAllExceptCsproj(string directoryPath, CancellationToken cancellationToken = default)
